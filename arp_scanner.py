@@ -4,7 +4,9 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from netmiko import ConnectHandler
+import paramiko 
 
+paramiko.SSHClient().set_missing_host_key_policy(paramiko.AutoAddPolicy())
 # --- 辅助函数：统一MAC格式 ---
 def format_mac(raw_mac):
     if not raw_mac: return None
