@@ -113,7 +113,7 @@ def main():
     # 2. 使用线程池并行采集
     # max_workers 建议根据核心数量调整，通常 5-10 比较稳健
     all_arp_records = []
-    with ThreadPoolExecutor(max_workers=5) as executor:
+    with ThreadPoolExecutor(max_workers=20) as executor:
         # 将任务分发给多个线程
         future_to_core = {executor.submit(scan_core_worker, core): core for core in cores}
         
