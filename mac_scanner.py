@@ -80,7 +80,7 @@ def task_scan_switch(sw_info):
             output = ssh.send_command_timing(cmd)
             full_output = output
             
-            max_pages = 200 # 针对 800 条以上的数据，增加翻页次数上限
+            max_pages = 50 # 针对 800 条以上的数据，增加翻页次数上限
             for _ in range(max_pages):
                 # 兼容思科的 --More-- 和 H3C 的 ---- More ----
                 if "More" in output:
