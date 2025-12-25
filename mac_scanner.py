@@ -56,74 +56,84 @@ def get_uplink_ports(ssh, brand, protocol):
 def task_scan_switch(sw_info):
     ip, brand, user, pwd, protocol = sw_info
     
-    base_type = 'hp_comware' if brand.lower() == 'h3c' else 'cisco_ios'
-    device_type = f"{base_type}_telnet" if protocol.lower() == 'telnet' else base_type
+    # 1. 自动识别设备类型
+    if brand.lower() == 'cisco':
+        device_type = 'cisco_ios_telnet' if protocol.lower() == 'telnet' else 'cisco_ios'
+        cmd = "show mac address-table"
+    else:
+        device_type = 'hp_comware_telnet' if protocol.lower() == 'telnet' else 'hp_comware'
+        cmd = "display mac-address"
     
     device = {
         'device_type': device_type,
         'ip': ip,
         'username': user,
         'password': pwd,
-        'timeout': COMMAND_TIMEOUT,
-        'global_delay_factor': 2,
+        'timeout': 120,
     }
-    
-    if protocol.lower() == 'ssh':
-        device['ssh_strict'] = False
 
     raw_results = []
     try:
-        # 错峰
-        time.sleep(random.uniform(0, 3))
-        
         with ConnectHandler(**device) as ssh:
-            # 1. 执行命令获取原始 MAC 表
-            if brand.lower() == 'h3c':
-                output = ssh.send_command("display mac-address dynamic")
-                pattern = r"([0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4})\s+(\d+)\s+[\w\-]+\s+([\w\/\-\.]+)"           
-            else:
-                output = ssh.send_command("show mac address-table dynamic")
-                pattern = r"(\d+)\s+([0-9a-fA-F]{4}\.[0-9a-fA-F]{4}\.[0-9a-fA-F]{4})\s+[\w\-]+\s+([\w\/\-\.]+)"
-
-            matches = re.findall(pattern, output)
+            # --- 核心：流式翻页处理 ---
+            # 使用 timing 模式发送初始命令
+            output = ssh.send_command_timing(cmd)
+            full_output = output
             
-            # 2. 第一次遍历：统计每个端口下的 MAC 数量
+            max_pages = 200 # 针对 800 条以上的数据，增加翻页次数上限
+            for _ in range(max_pages):
+                # 兼容思科的 --More-- 和 H3C 的 ---- More ----
+                if "More" in output:
+                    # 发送空格翻页
+                    output = ssh.send_command_timing(" ")
+                    full_output += output
+                # 检测到命令提示符（> 或 #），说明抓取结束
+                elif any(p in output for p in ['>', '#']):
+                    break
+                else:
+                    # [修复点] 使用 read_channel() 代替 get_raw_output()
+                    time.sleep(1)
+                    output = ssh.read_channel() 
+                    full_output += output
+                    if not output: break
+
+            # --- 2. 差异化正则表达式 ---
+            if brand.lower() == 'cisco':
+                # 思科匹配：VLAN  MAC(点分)  Type  Port
+                pattern = r"(\d+)\s+([0-9a-fA-F]{4}\.[0-9a-fA-F]{4}\.[0-9a-fA-F]{4})\s+\S+\s+(\S+)"
+            else:
+                # H3C 匹配：MAC(横杠)  VLAN  State  Port
+                pattern = r"([0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4})\s+(\d+)\s+\S+\s+(\S+)"
+
+            matches = re.findall(pattern, full_output)
+            
+            # --- 3. 结果解析与过滤 ---
             port_stats = {}
             temp_data = []
             for m in matches:
-                # 兼容不同品牌字段位置
-                v_mac, v_vlan, v_port = (m[0], m[1], m[2]) if brand.lower() == 'h3c' else (m[1], m[0], m[2])
+                if brand.lower() == 'cisco':
+                    v_vlan, v_mac, v_port = m
+                else:
+                    v_mac, v_vlan, v_port = m
                 
-                temp_data.append({'mac': format_mac(v_mac), 'port': v_port, 'vlan': v_vlan})
+                fmt_mac = "".join(filter(str.isalnum, v_mac)).upper()
+                temp_data.append({'mac': fmt_mac, 'port': v_port, 'vlan': v_vlan})
                 port_stats[v_port] = port_stats.get(v_port, 0) + 1
 
-            # 3. 第二次遍历：根据逻辑进行过滤
             for item in temp_data:
-                p_name = item['port']
-                p_upper = p_name.upper()
-
-                # --- 过滤逻辑开始 ---
-                # A. 过滤掉聚合口 (这些绝对是级联口)
-                if any(x in p_upper for x in ['BAGG', 'PORT-CHANNEL', 'PO', 'BRIDGE-AGG']):
-                    continue  # 此处 continue 现在已在 for 循环内
-                
-                # B. 过滤掉非物理端口 (如 VLAN 接口、NULL 接口等)
-                if any(x in p_upper for x in ['VLAN', 'NULL', 'RTK']):
+                p_name = item['port'].upper()
+                # 过滤常见非终端口
+                if any(x in p_name for x in ['PO', 'BAGG', 'NULL', 'VLAN', 'CPU', 'RMI']):
                     continue
-
-                # C. [可选建议] 
-                # 即使有 HUB，如果一个端口 MAC 超过 100 个，那 99% 还是上联口
-                # 如果不想过滤 HUB，可以把阈值设大（比如 100）
-                if port_stats[p_name] > 100:
+                # 过滤带机量过大的上联口
+                if port_stats[item['port']] > 100:
                     continue
-
-                # 符合条件的记录才加入结果集
-                raw_results.append((item['mac'], ip, p_name, item['vlan']))
-                # --- 过滤逻辑结束 ---
+                raw_results.append((item['mac'], ip, item['port'], item['vlan']))
 
         return ip, raw_results, True
     except Exception as e:
-        return ip, str(e), False
+        return ip, f"Error: {str(e)}", False
+        
 # --- 4. 数据库批量写入 (WAL 增强版) ---
 def save_to_db(all_records):
     if not all_records: return
