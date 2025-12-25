@@ -1,14 +1,19 @@
 import sqlite3
 import re
+import time
+import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from netmiko import ConnectHandler
+import paramiko 
 
-# --- 1. 配置参数 ---
-MAX_THREADS = 15  # 并发线程数，根据服务器性能可调至 10-30
-COMMAND_TIMEOUT = 15
+# 全局忽略 SSH 证书确认
+paramiko.SSHClient().set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
-# --- 2. 辅助工具函数 ---
+# --- 1. 配置与工具函数 ---
+MAX_THREADS = 25  # 500台规模建议设为 20-30
+COMMAND_TIMEOUT = 20
+
 def format_mac(raw_mac):
     if not raw_mac: return None
     return "".join(filter(str.isalnum, raw_mac)).upper()
@@ -16,41 +21,44 @@ def format_mac(raw_mac):
 def get_access_switches():
     conn = sqlite3.connect('network_tools.db')
     cursor = conn.cursor()
-    # 只抓取接入交换机
-    cursor.execute("SELECT ip, brand, username, password FROM switchs WHERE role='access'")
+    # 增加 protocol 字段读取
+    cursor.execute("SELECT ip, brand, username, password, protocol FROM switchs WHERE role='access'")
     switches = cursor.fetchall()
     conn.close()
     return switches
 
-def get_uplink_ports(ssh, brand):
-    """
-    核心优化：识别级联口（LLDP邻居口）
-    返回一个集合，包含所有连接了其他交换机的端口
-    """
+# --- 2. 增强型级联口识别 ---
+def get_uplink_ports(ssh, brand, protocol):
+    """识别级联口及聚合组，返回黑名单集合"""
     uplinks = set()
     try:
+        # LLDP 基础识别
+        lldp_cmd = "display lldp neighbor-information list" if brand.lower() == 'h3c' else "show lldp neighbors"
+        output = ssh.send_command(lldp_cmd)
+        for line in output.splitlines():
+            # 正则匹配端口名（支持H3C/Cisco多种格式）
+            match = re.search(r'^([a-zA-Z0-9/:-]+)', line.strip())
+            if match:
+                port = match.group(1)
+                if port.upper() not in ['SYSTEMNAME', 'LOCAL', 'CHASSIS', 'PORTID', '----']:
+                    uplinks.add(port)
+        
+        # H3C 额外识别聚合口
         if brand.lower() == 'h3c':
-            output = ssh.send_command("display lldp neighbor-information list")
-            # 匹配第一列的端口名，如 GE1/0/1 或 BAGG1
-            lines = output.splitlines()
-            for line in lines:
-                match = re.search(r'^([a-zA-Z0-9/:-]+)\s+', line.strip())
-                if match: uplinks.add(match.group(1))
-        else:
-            output = ssh.send_command("show lldp neighbors")
-            # Cisco 简化匹配 Local Intf
-            lines = output.splitlines()
-            for line in lines:
-                match = re.search(r'^([a-zA-Z0-9/:-]+)\s+', line.strip())
-                if match: uplinks.add(match.group(1))
-    except:
-        pass # 如果不支持LLDP则跳过过滤
+            agg_output = ssh.send_command("display link-aggregation summary")
+            agg_ports = re.findall(r'(BAGG\d+|Bridge-Aggregation\d+)', agg_output)
+            for p in agg_ports: uplinks.add(p)
+            
+    except: pass 
     return uplinks
 
-# --- 3. 单台交换机扫描任务 ---
+# --- 3. 单台扫描任务 (混合协议版) ---
 def task_scan_switch(sw_info):
-    ip, brand, user, pwd = sw_info
-    device_type = 'hp_comware' if brand.lower() == 'h3c' else 'cisco_ios'
+    ip, brand, user, pwd, protocol = sw_info
+    
+    # 协议自适应逻辑
+    base_type = 'hp_comware' if brand.lower() == 'h3c' else 'cisco_ios'
+    device_type = f"{base_type}_telnet" if protocol.lower() == 'telnet' else base_type
     
     device = {
         'device_type': device_type,
@@ -58,15 +66,22 @@ def task_scan_switch(sw_info):
         'username': user,
         'password': pwd,
         'timeout': COMMAND_TIMEOUT,
+        'global_delay_factor': 2, # 提高 Telnet 稳定性
     }
+    
+    if protocol.lower() == 'ssh':
+        device['ssh_strict'] = False
 
     results = []
     try:
+        # 错峰起步，防止瞬间冲击
+        time.sleep(random.uniform(0, 3))
+        
         with ConnectHandler(**device) as ssh:
-            # A. 先获取级联口黑名单
-            uplinks = get_uplink_ports(ssh, brand)
+            # A. 抓取级联黑名单
+            uplinks = get_uplink_ports(ssh, brand, protocol)
             
-            # B. 获取 MAC 地址表
+            # B. 抓取 MAC 地址表
             if brand.lower() == 'h3c':
                 output = ssh.send_command("display mac-address dynamic")
                 pattern = r"([0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4})\s+(\d+)\s+\w+\s+([\w\/\-\.]+)"
@@ -82,12 +97,16 @@ def task_scan_switch(sw_info):
                 else:
                     vlan, mac, port = match
                 
-                # 过滤逻辑：
-                # 1. 过滤掉级联口 (LLDP 发现的邻居口)
-                # 2. 过滤掉聚合口 (BAGG/Po/Port-channel)
                 port_upper = port.upper()
+                # 过滤逻辑：
+                # 1. 精准黑名单匹配
                 if port in uplinks: continue
-                if any(x in port_upper for x in ['BAGG', 'PORT-CHANNEL', 'PO', 'BRIDGE-AGG']): continue
+                # 2. 模糊后缀匹配（针对未识别出的聚合口）
+                if any(x in port_upper for x in ['BAGG', 'PORT-CHANNEL', 'PO', 'BRIDGE-AGG', 'VLAN', 'NULL', 'RTK']): 
+                    continue
+                # 3. 交叉匹配（处理 GE1/0/1 vs GigabitEthernet1/0/1）
+                if any(up in port_upper or port_upper in up.upper() for up in uplinks):
+                    continue
                 
                 results.append((format_mac(mac), ip, port, vlan))
                 
@@ -95,10 +114,12 @@ def task_scan_switch(sw_info):
     except Exception as e:
         return ip, str(e), False
 
-# --- 4. 数据库批量写入 ---
+# --- 4. 数据库批量写入 (WAL 增强版) ---
 def save_to_db(all_records):
     if not all_records: return
-    conn = sqlite3.connect('network_tools.db')
+    conn = sqlite3.connect('network_tools.db', timeout=30)
+    # 开启 WAL 模式提高并发性能
+    conn.execute("PRAGMA journal_mode=WAL;")
     cursor = conn.cursor()
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     
@@ -117,17 +138,20 @@ def save_to_db(all_records):
 # --- 5. 主程序 ---
 def main():
     start_time = datetime.now()
-    print(f"[*] MAC 扫描任务开始: {start_time.strftime('%H:%M:%S')}")
+    print(f"[*] MAC 混合协议扫描开始: {start_time.strftime('%H:%M:%S')}")
     
     switches = get_access_switches()
     if not switches:
-        print("[-] 没有找到接入交换机资产。")
+        print("[-] 未找到接入交换机资产。")
         return
 
-    total_mac_count = 0
-    all_mac_records = []
+    # 扫描前清空旧数据，防止陈旧记录干扰 Locator
+    conn = sqlite3.connect('network_tools.db')
+    conn.execute("DELETE FROM mac_table")
+    conn.commit()
+    conn.close()
 
-    # 使用线程池并发执行
+    all_mac_records = []
     with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
         future_to_sw = {executor.submit(task_scan_switch, sw): sw[0] for sw in switches}
         
@@ -137,20 +161,17 @@ def main():
                 ip, data, success = future.result()
                 if success:
                     all_mac_records.extend(data)
-                    print(f"[+] {ip} 扫描完成 (抓取到 {len(data)} 条有效终端记录)")
+                    print(f"[+] {ip} 成功 (抓取终端: {len(data)})")
                 else:
-                    print(f"[!] {ip} 扫描失败: {data}")
+                    print(f"[!] {ip} 失败: {data}")
             except Exception as e:
-                print(f"[!] {sw_ip} 线程崩溃: {e}")
+                print(f"[!] {sw_ip} 崩溃: {e}")
 
-    # 批量入库
-    print(f"[*] 正在写入数据库...")
+    print(f"[*] 写入数据库 (总计: {len(all_mac_records)})...")
     save_to_db(all_mac_records)
     
     duration = (datetime.now() - start_time).seconds
-    print(f"--- 扫描结束 ---")
-    print(f"总耗时: {duration} 秒")
-    print(f"总计有效终端记录: {len(all_mac_records)} 条")
+    print(f"--- 扫描结束 | 耗时: {duration}s | 有效终端: {len(all_mac_records)} ---")
 
 if __name__ == "__main__":
     main()
