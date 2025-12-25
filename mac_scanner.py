@@ -80,10 +80,10 @@ def task_scan_switch(sw_info):
             # 1. 执行命令获取原始 MAC 表
             if brand.lower() == 'h3c':
                 output = ssh.send_command("display mac-address dynamic")
-                pattern = r"([0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4})\s+(\d+)\s+\w+\s+([\w\/\-\.]+)"
+                pattern = r"([0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4})\s+(\d+)\s+[\w\-]+\s+([\w\/\-\.]+)"           
             else:
                 output = ssh.send_command("show mac address-table dynamic")
-                pattern = r"(\d+)\s+([0-9a-fA-F]{4}\.[0-9a-fA-F]{4}\.[0-9a-fA-F]{4})\s+\w+\s+([\w\/\-\.]+)"
+                pattern = r"(\d+)\s+([0-9a-fA-F]{4}\.[0-9a-fA-F]{4}\.[0-9a-fA-F]{4})\s+[\w\-]+\s+([\w\/\-\.]+)"
 
             matches = re.findall(pattern, output)
             
