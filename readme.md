@@ -3,9 +3,10 @@
 
 # 使用方法
 1.如config_env_example.py中的格式填写交换机的信息：模板、用户名、密码、核心交换机表、接入交换机表
-2.生成数据库文件,数据库使用sqlite
+2.生成数据库文件,数据库使用sqlite，导入数据库
 ```bash
 python init_db.py
+Python import_db.py
 ```
 3.收集arp表，建议计划任务根据自己需要生成arp表时间，根据办公环境或生产环境，选择合适的执行入库周期
 ```bash
