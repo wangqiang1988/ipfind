@@ -92,23 +92,15 @@ def task_scan_switch(sw_info):
             matches = re.findall(pattern, output)
             
             for match in matches:
-                if brand.lower() == 'h3c':
-                    mac, vlan, port = match
-                else:
-                    vlan, mac, port = match
-                
+                vlan, mac, port = (match[1], match[0], match[2]) if brand.lower() == 'h3c' else match
                 port_upper = port.upper()
-                # 过滤逻辑：
-                # 1. 精准黑名单匹配
-                if port in uplinks: continue
-                # 2. 模糊后缀匹配（针对未识别出的聚合口）
-                if any(x in port_upper for x in ['BAGG', 'PORT-CHANNEL', 'PO', 'BRIDGE-AGG', 'VLAN', 'NULL', 'RTK']): 
-                    continue
-                # 3. 交叉匹配（处理 GE1/0/1 vs GigabitEthernet1/0/1）
-                if any(up in port_upper or port_upper in up.upper() for up in uplinks):
-                    continue
-                
-                results.append((format_mac(mac), ip, port, vlan))
+
+    # 1. 依然要过滤逻辑口（聚合口绝对不是终端口）
+            if any(x in port_upper for x in ['BAGG', 'PORT-CHANNEL', 'PO', 'BRIDGE-AGG']): 
+                continue
+    
+    # 2. 这里的物理口（GE/Eth）不做 MAC 数量限制，全量返回
+            results.append((format_mac(mac), ip, port, vlan))
                 
         return ip, results, True
     except Exception as e:

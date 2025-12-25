@@ -1,3 +1,5 @@
 __pycache__/
 config_env.*
 network_tools.db
+iplist.txt
+filter.py
