@@ -11,7 +11,7 @@ import paramiko
 paramiko.SSHClient().set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
 # --- 1. 配置与工具函数 ---
-MAX_THREADS = 25  # 500台规模建议设为 20-30
+MAX_THREADS = 50
 COMMAND_TIMEOUT = 20
 
 def format_mac(raw_mac):
