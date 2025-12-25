@@ -1,6 +1,7 @@
 __pycache__/
 config_env.*
-network_tools.db
+network_tools.*
 iplist.txt
 filter.py
 ipfind
+app.py
