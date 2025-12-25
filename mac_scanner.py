@@ -69,7 +69,7 @@ def task_scan_switch(sw_info):
         'ip': ip,
         'username': user,
         'password': pwd,
-        'timeout': 120,
+        'timeout': 20,
     }
 
     raw_results = []
